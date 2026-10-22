@@ -24,6 +24,7 @@ struct LibraryFootprint {
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+    zones: Vec<kiapi::board::types::Zone>,
 }
 
 #[derive(Debug)]
@@ -41,6 +42,7 @@ enum ChangedDomain {
     Attributes,
     Metadata,
     Models,
+    RuleAreas,
 }
 
 #[derive(Debug)]
@@ -295,10 +297,19 @@ pub(crate) async fn handle_update_footprints_from_library(
                 return Ok(plan_response(&plan, false));
             }
 
-            let update_count = plan.prepared_items.len();
+            let expected_items = std::mem::take(&mut plan.prepared_items);
+            let update_count = expected_items.len();
             client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
+                client.update_items_in(document.clone(), expected_items.clone())
             })?;
+            let verified = client.get_items_in(document, ObjectType::KotPcbFootprint)
+                .and_then(|observed| verify_refreshed_items(&expected_items, &observed));
+            if let Err(error) = verified {
+                return Ok(crate::tools::ipc_uncertain_result(&format!(
+                    "Footprint library update was published on '{}', but fresh readback did not confirm the refreshed content and preserved instance state: {error:#}",
+                    planning_board_path.display()
+                )));
+            }
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -327,6 +338,88 @@ pub(crate) async fn handle_update_footprints_from_library(
             preflight_conflict(message)
         }
     })
+}
+
+/// Confirm the changed footprints from a new native read, after connectivity and commits settle.
+fn verify_refreshed_items(
+    expected: &[prost_types::Any],
+    observed: &[prost_types::Any],
+) -> Result<()> {
+    let observed = observed
+        .iter()
+        .map(|item| {
+            if !konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+                bail!("non-footprint payload in footprint readback");
+            }
+            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let id = footprint
+                .id
+                .as_ref()
+                .context("readback footprint has no UUID")?
+                .value
+                .clone();
+            Ok((id, footprint))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for item in expected {
+        let expected = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let id = &expected
+            .id
+            .as_ref()
+            .context("prepared footprint has no UUID")?
+            .value;
+        let actual = observed
+            .get(id)
+            .with_context(|| format!("refreshed footprint '{id}' is missing"))?;
+        let nets = expected
+            .definition
+            .iter()
+            .flat_map(|d| d.items.iter())
+            .filter(|i| konnect_ipc::builders::any_is(i, "kiapi.board.types.Pad"))
+            .map(|i| kiapi::board::types::Pad::decode(i.value.as_slice()))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|p| p.net.map(|n| (p.number, n)))
+            .collect();
+        let pad_nets =
+            |footprint: &kiapi::board::types::FootprintInstance| -> Result<Vec<(String, String)>> {
+                let mut rows = Vec::new();
+                for item in footprint
+                    .definition
+                    .iter()
+                    .flat_map(|d| d.items.iter())
+                    .filter(|i| konnect_ipc::builders::any_is(i, "kiapi.board.types.Pad"))
+                {
+                    let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+                    rows.push((pad.number, pad.net.unwrap_or_default().name));
+                }
+                rows.sort();
+                Ok(rows)
+            };
+        if pad_nets(&expected)? != pad_nets(actual)? {
+            bail!("refreshed footprint '{id}' changed pad net assignments");
+        }
+        let preserved = PreservedState::derive(&expected, actual, &nets);
+        if !preserved.position
+            || !preserved.rotation
+            || !preserved.layer
+            || !preserved.locked
+            || !preserved.kiid
+            || !preserved.symbol_path
+            || !preserved.pad_nets
+            || !preserved.instance_overrides
+        {
+            bail!("refreshed footprint '{id}' did not preserve instance state: {preserved:?}");
+        }
+        let differences = changed_domains(&expected, actual)?;
+        if !differences.is_empty()
+            || field_text(&expected.reference_field) != field_text(&actual.reference_field)
+            || field_text(&expected.value_field) != field_text(&actual.value_field)
+        {
+            bail!("refreshed footprint '{id}' differs from the prepared library content: {differences:?}");
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_routed_nets(
@@ -747,6 +840,14 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = super::library_footprint::models(&root)?;
+    let zones = root
+        .find_all("zone")
+        .iter()
+        .map(|zone| {
+            super::footprint_rule_areas::parse_rule_area(zone)
+                .context("footprint zone cannot be refreshed")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let attributes = super::library_footprint::attributes(&root)?;
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
@@ -767,6 +868,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         pads,
         graphics,
         models,
+        zones,
     })
 }
 
@@ -835,6 +937,7 @@ fn parse_library_property(
     let mut knockout = None;
     let mut attributes = None;
     let mut identifier = None;
+    let mut unlocked = None;
 
     for clause in property.children().unwrap_or_default().iter().skip(3) {
         let tag = clause
@@ -878,6 +981,14 @@ fn parse_library_property(
                         .with_context(|| format!("property '{name}' has an unsupported layer"))?
                         as i32,
                 );
+            }
+            "unlocked" => {
+                if unlocked.is_some() {
+                    bail!("property '{name}' contains duplicate 'unlocked' clauses");
+                }
+                // KiCad pcb_io_kicad_sexpr_parser.cpp: unlocked refers to keep upright,
+                // not PCB_TEXT::locked. Mandatory field presentation stays instance-owned.
+                unlocked = Some(property_yes_no(clause, name, "unlocked")?);
             }
             "hide" => {
                 if hidden.is_some() {
@@ -932,6 +1043,7 @@ fn parse_library_property(
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
+    attributes.keep_upright = !unlocked.unwrap_or(false);
     Ok(Some(kiapi::board::types::Field {
         id: None,
         name: name.to_string(),
@@ -1141,7 +1253,7 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
         match tag {
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
-            | "fp_poly" | "pad" | "model" => {}
+            | "fp_poly" | "pad" | "model" | "zone" => {}
             // KiCad 10 writes these two flags into every footprint it saves
             // (all 15,428 official library files carry them, every one at its
             // default). At the default the typed rebuild loses nothing;
@@ -1572,6 +1684,54 @@ fn build_updated_instance(
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }),
     );
+    for zone in &library.zones {
+        let mut zone = zone.clone();
+        zone.id = None;
+        zone.parent = None;
+        if is_back {
+            zone.layers = zone
+                .layers
+                .iter()
+                .map(|layer| {
+                    let layer = kiapi::board::types::BoardLayer::try_from(*layer)?;
+                    let name = konnect_ipc::builders::layer_name(layer)
+                        .context("rule area has unnamed layer")?;
+                    Ok(konnect_ipc::builders::try_layer_from_name(&flip_layer_name(name)?)? as i32)
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+        let (sin, cos) = rotation.to_radians().sin_cos();
+        for polygon in &mut zone
+            .outline
+            .as_mut()
+            .context("rule area has no outline")?
+            .polygons
+        {
+            for node in &mut polygon
+                .outline
+                .as_mut()
+                .context("rule area has no polygon")?
+                .nodes
+            {
+                if let Some(kiapi::common::types::poly_line_node::Geometry::Point(point)) =
+                    node.geometry.as_mut()
+                {
+                    let x = point.x_nm as f64;
+                    let y = if is_back {
+                        -(point.y_nm as f64)
+                    } else {
+                        point.y_nm as f64
+                    };
+                    point.x_nm = position.x_nm + (x * cos + y * sin).round() as i64;
+                    point.y_nm = position.y_nm + (y * cos - x * sin).round() as i64;
+                }
+            }
+        }
+        definition.items.push(konnect_ipc::builders::pack_any(
+            &zone,
+            "kiapi.board.types.Zone",
+        ));
+    }
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
@@ -1737,7 +1897,11 @@ fn transform_library_property(
         local_angle
     };
     attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: readable_property_angle(local_angle + footprint_rotation),
+        value_degrees: if attributes.keep_upright {
+            readable_property_angle(local_angle + footprint_rotation)
+        } else {
+            (local_angle + footprint_rotation).rem_euclid(360.0)
+        },
     });
     if is_back {
         attributes.mirrored = !attributes.mirrored;
@@ -1930,6 +2094,11 @@ fn changed_domains(
     if current_graphics != updated_graphics {
         changed.insert(ChangedDomain::Graphics);
     }
+    if normalized_items(current_definition, "Zone")?
+        != normalized_items(updated_definition, "Zone")?
+    {
+        changed.insert(ChangedDomain::RuleAreas);
+    }
     if normalized_items(current_definition, "Footprint3DModel")?
         != normalized_items(updated_definition, "Footprint3DModel")?
     {
@@ -1965,6 +2134,7 @@ fn normalized_items(
             if suffix == "Pad" {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
                 pad.id = None;
+                pad.parent = None;
                 pad.net = None;
                 pad.pad_to_die_length = None;
                 pad.symbol_pin = None;
@@ -1990,11 +2160,27 @@ fn normalized_items(
                     }
                 }
                 Ok(pad.encode_to_vec())
+            } else if suffix == "Zone" {
+                let mut zone = kiapi::board::types::Zone::decode(item.value.as_slice())?;
+                zone.id = None;
+                zone.parent = None;
+                zone.layers.sort_unstable();
+                // KiCad initializes empty per-layer fill containers even on unfilled rule areas.
+                zone.filled_polygons.retain(|fill| {
+                    fill.shapes
+                        .as_ref()
+                        .is_some_and(|shapes| !shapes.polygons.is_empty())
+                });
+                if let Some(outline) = zone.outline.as_mut() {
+                    normalize_polyset(outline);
+                }
+                Ok(zone.encode_to_vec())
             } else if suffix == "Field" {
                 let mut field = kiapi::board::types::Field::decode(item.value.as_slice())?;
                 field.id = None;
                 if let Some(text) = field.text.as_mut() {
                     text.id = None;
+                    text.parent = None;
                 }
                 Ok(field.encode_to_vec())
             } else {
@@ -2016,6 +2202,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                     kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).map(
                         |mut shape| {
                             shape.id = None;
+                            shape.parent = None;
                             shape.net = None;
                             shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
                             if let Some(graphic) = shape.shape.as_mut() {
@@ -2065,6 +2252,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                     kiapi::board::types::BoardText::decode(item.value.as_slice()).map(
                         |mut text| {
                             text.id = None;
+                            text.parent = None;
                             text.encode_to_vec()
                         },
                     ),
@@ -2094,6 +2282,10 @@ fn normalize_polyset(polyset: &mut kiapi::common::types::PolySet) {
 fn normalize_polyline(polyline: &mut kiapi::common::types::PolyLine) {
     if !polyline.closed || polyline.nodes.len() < 2 {
         return;
+    }
+    // Native PolyLine serialization omits an explicitly repeated closing vertex.
+    while polyline.nodes.len() > 1 && polyline.nodes.first() == polyline.nodes.last() {
+        polyline.nodes.pop();
     }
     let candidates = [
         polyline.nodes.clone(),
@@ -2171,6 +2363,176 @@ mod tests {
     /// fixture alone cannot catch this class: it shares this module's own
     /// assumptions about the format (see the fixtures-from-KiCad rule in
     /// CONTRIBUTING).
+    const NATIVE_RULE_AREA: &str =
+        include_str!("../../tests/fixtures/refresh_rule_area_10_0_6.kicad_mod");
+
+    #[test]
+    fn native_empty_rule_area_fill_and_explicit_closure_compare_equal() {
+        let library = parse_library_footprint("Repair:RuleArea", NATIVE_RULE_AREA).unwrap();
+        let expected = library.zones[0].clone();
+        let mut observed = expected.clone();
+        observed
+            .filled_polygons
+            .push(kiapi::board::types::ZoneFilledPolygons {
+                layer: observed.layers[0],
+                shapes: Some(Default::default()),
+            });
+        let outline = observed.outline.as_mut().unwrap().polygons[0]
+            .outline
+            .as_mut()
+            .unwrap();
+        outline.nodes.push(outline.nodes[0]);
+        let definition = |zone| kiapi::board::types::Footprint {
+            items: vec![builders::pack_any(&zone, "kiapi.board.types.Zone")],
+            ..Default::default()
+        };
+        assert_eq!(
+            normalized_items(&definition(expected), "Zone").unwrap(),
+            normalized_items(&definition(observed), "Zone").unwrap()
+        );
+    }
+
+    #[test]
+    fn fresh_readback_rejects_a_dropped_rule_area_or_changed_net() {
+        let library = parse_library_footprint("Repair:RuleArea", NATIVE_RULE_AREA).unwrap();
+        let mut expected = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        expected
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(builders::pack_any(
+                &library.zones[0],
+                "kiapi.board.types.Zone",
+            ));
+        let packed = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
+        verify_refreshed_items(std::slice::from_ref(&packed), std::slice::from_ref(&packed))
+            .unwrap();
+        let mut dropped = expected.clone();
+        dropped
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .retain(|i| !i.type_url.ends_with("Zone"));
+        assert!(verify_refreshed_items(
+            std::slice::from_ref(&packed),
+            &[builders::pack_any(
+                &dropped,
+                "kiapi.board.types.FootprintInstance"
+            )]
+        )
+        .is_err());
+        let mut changed = expected;
+        for item in &mut changed.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.net = Some(builders::net("WRONG", 99));
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+                break;
+            }
+        }
+        assert!(verify_refreshed_items(
+            &[packed],
+            &[builders::pack_any(
+                &changed,
+                "kiapi.board.types.FootprintInstance"
+            )]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_unlocked_fields_and_rule_area_are_represented() {
+        let library = parse_library_footprint("Repair:RuleArea", NATIVE_RULE_AREA).unwrap();
+        assert_eq!(library.zones.len(), 1);
+        let field = library
+            .properties
+            .iter()
+            .find(|f| f.name == "AssemblyVendor")
+            .unwrap();
+        assert!(
+            !field
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .keep_upright
+        );
+        let Some(kiapi::board::types::zone::Settings::RuleAreaSettings(settings)) =
+            &library.zones[0].settings
+        else {
+            panic!("expected rule-area settings");
+        };
+        assert!(settings.keepout_tracks && settings.keepout_vias && settings.keepout_copper);
+        assert!(!settings.keepout_pads && !settings.keepout_footprints);
+    }
+
+    #[test]
+    fn rule_area_refresh_follows_front_and_back_pose_and_preserves_instance_state() {
+        let library = parse_library_footprint("Repair:RuleArea", NATIVE_RULE_AREA).unwrap();
+        for (layer, local_x) in [
+            (kiapi::board::types::BoardLayer::BlFCu, -1_000_000),
+            (kiapi::board::types::BoardLayer::BlBCu, 1_000_000),
+        ] {
+            let mut current = current_instance(layer);
+            current.definition.as_mut().unwrap().id = library.definition.id.clone();
+            current.orientation = Some(kiapi::common::types::Angle {
+                value_degrees: 90.0,
+            });
+            // This native fixture contains a rule area and fields only. Existing tests
+            // cover logical-pad preservation; the live 19-instance test also checks pad nets.
+            current
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .retain(|item| !item.type_url.ends_with("Pad"));
+            let prepared = build_updated_instance(
+                &current,
+                &library,
+                &BTreeMap::from([("ROW1".into(), 11)]),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let updated =
+                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                    .unwrap();
+            assert_eq!(updated.position, current.position);
+            assert_eq!(updated.orientation, current.orientation);
+            assert_eq!(updated.id, current.id);
+            assert_eq!(updated.overrides, current.overrides);
+            let definition = updated.definition.as_ref().unwrap();
+            let zone = definition
+                .items
+                .iter()
+                .find(|item| item.type_url.ends_with("Zone"))
+                .unwrap();
+            let zone = kiapi::board::types::Zone::decode(zone.value.as_slice()).unwrap();
+            assert_eq!(zone.layers, vec![layer as i32]);
+            let node = &zone.outline.as_ref().unwrap().polygons[0]
+                .outline
+                .as_ref()
+                .unwrap()
+                .nodes[0];
+            let Some(kiapi::common::types::poly_line_node::Geometry::Point(point)) = &node.geometry
+            else {
+                panic!("expected point")
+            };
+            let position = current.position.as_ref().unwrap();
+            assert_eq!(
+                (point.x_nm, point.y_nm),
+                (position.x_nm + local_x, position.y_nm + 2_000_000)
+            );
+            assert!(prepared.changed_domains.contains(&ChangedDomain::RuleAreas));
+        }
+    }
+
     #[test]
     fn a_footprint_kicad_saved_is_accepted_not_refused() {
         let source = KICAD_LIBRARY_FOOTPRINT;
@@ -2797,13 +3159,13 @@ mod tests {
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unsupported_property yes)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
-        assert!(message.contains("unlocked"), "{message}");
+        assert!(message.contains("unsupported_property"), "{message}");
 
         let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
             "\"KiLib_Generator\" \"konnect_test_generator\"",
@@ -2828,7 +3190,9 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!(
+                    "\t(property \"{name}\" \"{value}\"\n\t\t(unsupported_property yes)\n\t\t(at"
+                ),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2836,7 +3200,7 @@ mod tests {
                 Err(error) => {
                     let message = error.to_string();
                     assert!(message.contains(name), "{message}");
-                    assert!(message.contains("unlocked"), "{message}");
+                    assert!(message.contains("unsupported_property"), "{message}");
                 }
             }
 
@@ -2958,8 +3322,8 @@ mod tests {
         for (from, to, expected) in [
             (
                 "(at 0 1.5 0) (layer \"F.Fab\")",
-                "(at 0 1.5 0) (unlocked yes) (layer \"F.Fab\")",
-                "unlocked",
+                "(at 0 1.5 0) (unsupported_property yes) (layer \"F.Fab\")",
+                "unsupported_property",
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
@@ -3194,7 +3558,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unsupported_property yes)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),
@@ -3216,7 +3580,7 @@ mod tests {
         assert!(plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "unsupported_library_footprint"
                 && diagnostic.message.contains("AssemblyVendor")
-                && diagnostic.message.contains("unlocked")
+                && diagnostic.message.contains("unsupported_property")
         }));
     }
 
@@ -3562,6 +3926,7 @@ mod tests {
         board: &Path,
         footprint: prost_types::Any,
         fail_update: bool,
+        corrupt_readback: bool,
     ) -> PlannerMock {
         use nng::options::Options;
 
@@ -3580,6 +3945,7 @@ mod tests {
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
+            let mut footprint = footprint;
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
                 let message = request.message.expect("request message");
@@ -3643,6 +4009,18 @@ mod tests {
                         .unwrap()
                         .update_batches
                         .push(update.items.len());
+                    if !fail_update {
+                        footprint = update.items[0].clone();
+                        if corrupt_readback {
+                            let mut changed = kiapi::board::types::FootprintInstance::decode(
+                                footprint.value.as_slice(),
+                            )
+                            .unwrap();
+                            changed.position = Some(builders::vec2(999.0, 999.0));
+                            footprint =
+                                builders::pack_any(&changed, "kiapi.board.types.FootprintInstance");
+                        }
+                    }
                     let updated_items = update
                         .items
                         .into_iter()
@@ -3697,7 +4075,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_and_stale_revision_never_open_a_commit_or_send_updates() {
         let (_temp, board, items) = plan_fixture();
-        let mock = spawn_planner_mock(&board, items[2].clone(), false);
+        let mock = spawn_planner_mock(&board, items[2].clone(), false, false);
         let context = test_context(&mock.url);
 
         let dry_run =
@@ -3729,7 +4107,7 @@ mod tests {
     #[tokio::test]
     async fn apply_sends_one_batch_in_one_commit() {
         let (_temp, board, items) = plan_fixture();
-        let mock = spawn_planner_mock(&board, items[2].clone(), false);
+        let mock = spawn_planner_mock(&board, items[2].clone(), false, false);
         let context = test_context(&mock.url);
         let dry_run =
             handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
@@ -3764,9 +4142,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_update_with_wrong_readback_is_uncertain_not_applied() {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock(&board, items[2].clone(), false, true);
+        let context = test_context(&mock.url);
+        let planned = handle_update_footprints_from_library(&json!({"board":board}), &context)
+            .await
+            .unwrap();
+        let revision = result_json(&planned)["plan_revision"].clone();
+        let result = handle_update_footprints_from_library(
+            &json!({"board":board,"dry_run":false,"expected_plan_revision":revision}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("ipc_outcome_unknown")
+        );
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(
+            capture.commit_actions,
+            vec![kiapi::common::commands::CommitAction::CmaCommit]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_update_drops_the_single_commit() {
         let (_temp, board, items) = plan_fixture();
-        let mock = spawn_planner_mock(&board, items[2].clone(), true);
+        let mock = spawn_planner_mock(&board, items[2].clone(), true, false);
         let context = test_context(&mock.url);
         let dry_run =
             handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)

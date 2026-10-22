@@ -16,6 +16,7 @@ pub mod editor_navigation;
 mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
+mod footprint_rule_areas;
 pub mod integration;
 mod jlcpcb_midpoints;
 mod lcsc_packages;

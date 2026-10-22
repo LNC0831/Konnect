@@ -1,0 +1,93 @@
+(footprint "RuleArea"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(property "Reference" "REF**"
+		(at 0 0 0)
+		(layer "F.SilkS")
+		(uuid "f674ce66-1e39-4c53-a427-02cf434490fb")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Value" "RuleArea"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "de6c58a9-0c4c-44cc-87c5-0b06202fba36")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Datasheet" "https://example.com/datasheet"
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "8806b573-3f13-447a-a5a3-b379d70ef19d")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "b8214bec-9806-4264-9787-9a7fa1e9e81a")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "AssemblyVendor" "Example Assembly"
+		(at 1 2 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "ebd95ea8-74ac-421d-838d-b41dd4b263bc")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(zone
+		(layer "F.Cu")
+		(uuid "166237d8-c1d9-4f4c-b575-e04bed06820a")
+		(hatch edge 0.5)
+		(connect_pads
+			(clearance 0)
+		)
+		(min_thickness 0.25)
+		(keepout
+			(tracks not_allowed)
+			(vias not_allowed)
+			(pads allowed)
+			(copperpour not_allowed)
+			(footprints allowed)
+		)
+		(placement
+			(enabled no)
+			(sheetname "")
+		)
+		(fill
+			(thermal_gap 0.5)
+			(thermal_bridge_width 0.5)
+			(island_removal_mode 0)
+		)
+		(polygon
+			(pts
+				(xy -2 -1) (xy 2 -1) (xy 2 1) (xy -2 1)
+			)
+		)
+	)
+	(embedded_fonts no)
+)
