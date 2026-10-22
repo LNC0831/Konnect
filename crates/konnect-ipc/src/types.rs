@@ -463,6 +463,8 @@ pub struct IpcTrack {
 /// already carries a net, and only a read-back shows that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcVia {
+    /// Revision of the complete native payload, including unknown fields.
+    pub revision: String,
     /// KIID of the via. Empty only if KiCad returned a via without an id.
     pub uuid: String,
     /// Net name, empty when the via carries no net.
@@ -494,23 +496,6 @@ pub enum IpcViaPlacement {
         requested_net: String,
         stored: IpcVia,
         removed: bool,
-    },
-}
-
-/// What `move_via` did.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum IpcViaMove {
-    /// No via with that KIID is on the requested board. Nothing was sent.
-    NotFound,
-    /// A fresh read-back shows the via at the new position, still on its net.
-    Moved { before: IpcVia, after: IpcVia },
-    /// At the new position KiCad put the via on a different net. It was
-    /// moved back when `restored` is true; `moved` is what KiCad had made of
-    /// it.
-    NetChanged {
-        before: IpcVia,
-        moved: IpcVia,
-        restored: bool,
     },
 }
 

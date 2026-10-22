@@ -4675,11 +4675,19 @@ impl KiCadIpcClient {
             .iter()
             // Type-check before decoding, as `get_tracks_in` does: protobuf
             // decoding accepts compatible bytes under the wrong declared type.
-            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
             .map(|item| {
-                kiapi::board::types::Via::decode(item.value.as_slice())
-                    .map(|via| ipc_via(&via))
-                    .context("KiCad returned an unreadable via")
+                anyhow::ensure!(
+                    crate::builders::any_is(item, "kiapi.board.types.Via"),
+                    "KiCad returned a non-via payload for a via query"
+                );
+                let via = kiapi::board::types::Via::decode(item.value.as_slice())
+                    .context("KiCad returned an unreadable via")?;
+                anyhow::ensure!(
+                    via.id.as_ref().is_some_and(|id| !id.value.is_empty())
+                        && via.position.is_some(),
+                    "KiCad returned a via without identity or position"
+                );
+                Ok(ipc_via(&via, &item.value))
             })
             .collect()
     }
@@ -4689,17 +4697,18 @@ impl KiCadIpcClient {
         &self,
         document: kiapi::common::types::DocumentSpecifier,
         uuid: &str,
-    ) -> Result<Option<kiapi::board::types::Via>> {
+    ) -> Result<Option<(kiapi::board::types::Via, Vec<u8>)>> {
         let items =
             self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?;
-        for item in &items {
-            if !crate::builders::any_is(item, "kiapi.board.types.Via") {
-                continue;
-            }
+        for item in items {
+            anyhow::ensure!(
+                crate::builders::any_is(&item, "kiapi.board.types.Via"),
+                "KiCad returned a non-via payload for a via query"
+            );
             let via = kiapi::board::types::Via::decode(item.value.as_slice())
                 .context("KiCad returned an unreadable via")?;
             if via.id.as_ref().map(|id| id.value.as_str()) == Some(uuid) {
-                return Ok(Some(via));
+                return Ok(Some((via, item.value)));
             }
         }
         Ok(None)
@@ -4725,32 +4734,42 @@ impl KiCadIpcClient {
     ) -> Result<IpcViaPlacement> {
         let net_code = self.resolve_net_code_in(document.clone(), net_name)?;
         let via = crate::builders::build_via(net_name, net_code, x, y, drill, pad_size);
-        let created = self.create_items_in_returning(
-            document.clone(),
-            vec![crate::builders::pack_any(&via, "kiapi.board.types.Via")],
-        )?;
-        let kiid = created
-            .iter()
-            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
-            .find_map(|item| kiapi::board::types::Via::decode(item.value.as_slice()).ok())
-            .and_then(|via| via.id)
-            .map(|id| id.value)
-            .filter(|id| !id.is_empty())
-            .context(
-                "KiCad created the via but did not report its KIID, so the net it stored \
-                 cannot be read back",
-            )?;
+        let created = self.run_commit("Add via", |client| {
+            client.create_items_in_returning(
+                document.clone(),
+                vec![crate::builders::pack_any(&via, "kiapi.board.types.Via")],
+            )
+        })?;
+        let kiid = (|| -> Result<String> {
+            anyhow::ensure!(created.len() == 1, "expected exactly one created via");
+            let item = &created[0];
+            anyhow::ensure!(crate::builders::any_is(item, "kiapi.board.types.Via"), "creation response is not a via");
+            let created_via = kiapi::board::types::Via::decode(item.value.as_slice())?;
+            let id = created_via.id.context("creation response has no KIID")?.value;
+            anyhow::ensure!(!id.is_empty(), "creation response has an empty KIID");
+            Ok(id)
+        })().map_err(|error| IpcOutcomeUnknown {
+            command: "CreateItems".into(),
+            reason: format!("via creation was published, but identity is unavailable: {error:#}; query the live board before retrying"),
+        })?;
         let stored = self
-            .find_via_in(document.clone(), &kiid)?
-            .map(|via| ipc_via(&via))
-            .with_context(|| {
-                format!("KiCad created via '{kiid}' but read-back does not list it")
+            .find_via_in(document.clone(), &kiid)
+            .map_err(|error| IpcOutcomeUnknown {
+                command: "CreateItems".into(),
+                reason: format!("created via '{kiid}', but post-commit readback failed: {error:#}"),
+            })?
+            .map(|(via, payload)| ipc_via(&via, &payload))
+            .ok_or_else(|| IpcOutcomeUnknown {
+                command: "CreateItems".into(),
+                reason: format!("created via '{kiid}' is missing from post-commit readback"),
             })?;
         if stored.net_name == net_name {
             return Ok(IpcViaPlacement::Placed(stored));
         }
         let removed = self
-            .delete_items_in(document.clone(), vec![kiid.clone()])
+            .run_commit("Remove mis-netted via", |client| {
+                client.delete_items_in(document.clone(), vec![kiid.clone()])
+            })
             .is_ok()
             && matches!(self.find_via_in(document, &kiid), Ok(None));
         Ok(IpcViaPlacement::NetMismatch {
@@ -4766,106 +4785,51 @@ impl KiCadIpcClient {
     /// KIID, so the item is first proven to be a via on this board, and a
     /// second read proves it is gone. `None` means no via carries `uuid`, and
     /// nothing was sent.
-    pub fn delete_via_verified(&self, requested: &Path, uuid: &str) -> Result<Option<IpcVia>> {
-        let document = self.find_open_board(requested)?;
-        let Some(via) = self.find_via_in(document.clone(), uuid)? else {
+    pub fn delete_via_verified_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+        expected_revision: &str,
+    ) -> Result<Option<IpcVia>> {
+        let Some((via, payload)) = self.find_via_in(document.clone(), uuid)? else {
             return Ok(None);
         };
-        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
-        let remains = self
-            .find_via_in(document, uuid)
-            .with_context(|| {
-                format!(
-                    "KiCad accepted deletion of via '{uuid}' but post-delete read-back failed; \
-                     the deletion may have committed"
-                )
-            })?
-            .is_some();
-        if remains {
-            anyhow::bail!("KiCad accepted deletion of via '{uuid}' but read-back still lists it");
+        let observed = ipc_via(&via, &payload);
+        // A locked or changed target is a refusal, never a delete followed by repair.
+        if observed.locked || observed.revision != expected_revision {
+            return Ok(None);
         }
-        Ok(Some(ipc_via(&via)))
-    }
-
-    /// Move one observed via to `(x, y)` on the requested board.
-    ///
-    /// Only the position changes; drill, size, layers and net are carried
-    /// over from KiCad's own message. Moving a via onto copper of another net
-    /// can make KiCad store it on that net, so the net is read back too, and
-    /// a via that changed net is moved back rather than left shorting.
-    pub fn move_via_verified(
-        &self,
-        requested: &Path,
-        uuid: &str,
-        x: f64,
-        y: f64,
-    ) -> Result<IpcViaMove> {
-        let document = self.find_open_board(requested)?;
-        let Some(original) = self.find_via_in(document.clone(), uuid)? else {
-            return Ok(IpcViaMove::NotFound);
-        };
-        let before = ipc_via(&original);
-        let mut moved = original.clone();
-        moved.position = Some(crate::builders::vec2(x, y));
-        self.update_items_in(
-            document.clone(),
-            vec![crate::builders::pack_any(&moved, "kiapi.board.types.Via")],
-        )?;
-        let after = self
-            .find_via_in(document.clone(), uuid)
-            .with_context(|| {
-                format!(
-                    "KiCad accepted the move of via '{uuid}' but read-back failed; the move \
-                     may have committed"
-                )
-            })?
-            .map(|via| ipc_via(&via))
-            .with_context(|| {
-                format!("KiCad accepted the move of via '{uuid}' but read-back no longer lists it")
-            })?;
-        let target = crate::builders::vec2(x, y);
-        let held = &after.position;
-        if crate::builders::vec2(held.x, held.y) != target {
-            anyhow::bail!(
-                "KiCad accepted the move of via '{uuid}' but read-back places it at ({}, {}), \
-                 not ({x}, {y})",
-                held.x,
-                held.y
+        self.run_commit("Delete via", |client| {
+            let current = client.find_via_in(document.clone(), uuid)?;
+            anyhow::ensure!(
+                current.as_ref().is_some_and(|(_, bytes)| bytes == &payload),
+                "via '{uuid}' changed before deletion; no delete sent"
             );
+            client.delete_items_in(document.clone(), vec![uuid.to_string()])
+        })?;
+        match self.find_via_in(document, uuid) {
+            Ok(None) => Ok(Some(observed)),
+            result => Err(anyhow::Error::new(IpcOutcomeUnknown {
+                command: "DeleteItems".to_string(),
+                reason: format!("via '{uuid}' deletion was published, but absence could not be confirmed: {result:?}; inspect the live board before retrying"),
+            })),
         }
-        if after.net_name == before.net_name {
-            return Ok(IpcViaMove::Moved { before, after });
-        }
-        let restored = self
-            .update_items_in(
-                document.clone(),
-                vec![crate::builders::pack_any(
-                    &original,
-                    "kiapi.board.types.Via",
-                )],
-            )
-            .is_ok()
-            && self
-                .find_via_in(document, uuid)
-                .ok()
-                .flatten()
-                .map(|via| ipc_via(&via))
-                .as_ref()
-                == Some(&before);
-        Ok(IpcViaMove::NetChanged {
-            before,
-            moved: after,
-            restored,
-        })
     }
 }
 
+/// Identity of a complete native via payload; no decode/re-encode discards unknown fields.
+pub fn via_revision(payload: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(payload))
+}
+
 /// A via message as the read-back type, with every field taken from KiCad.
-fn ipc_via(via: &kiapi::board::types::Via) -> IpcVia {
+fn ipc_via(via: &kiapi::board::types::Via, payload: &[u8]) -> IpcVia {
     use kiapi::board::types::ViaType;
     let stack = via.pad_stack.as_ref();
     let drill = stack.and_then(|stack| stack.drill.as_ref());
     IpcVia {
+        revision: via_revision(payload),
         uuid: kiid_value(via.id.clone()),
         net_name: via
             .net
